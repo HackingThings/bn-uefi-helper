@@ -6,8 +6,9 @@ import os
 import csv
 import glob
 import uuid
-from binaryninja import (BackgroundTaskThread, SegmentFlag, SectionSemantics, BinaryReader, Symbol,
+from binaryninja import (BackgroundTaskThread, SegmentFlag, SectionSemantics, BinaryReader, Symbol, 
                          SymbolType, HighLevelILOperation, BinaryView)
+from binaryninja.typelibrary import TypeLibrary
 from binaryninja.highlevelil import HighLevelILInstruction
 from binaryninja.types import (Type, FunctionParameter)
 
@@ -47,11 +48,17 @@ class UEFIHelper(BackgroundTaskThread):
         """
 
         hdrs_path = os.path.join(self.dirname, 'headers')
-        headers = glob.glob(os.path.join(hdrs_path, '*.h'))
-        for hdr in headers:
-            _types = self.bv.platform.parse_types_from_source_file(hdr)
-            for name, _type in _types.types.items():
-                self.bv.define_user_type(name, _type)
+        typelibraries = glob.glob(os.path.join(hdrs_path, '*.bntl'))
+        for tl in typelibraries:
+            self.bv.add_type_library(TypeLibrary.load_from_file(tl))
+        self.bv.import_library_type("EFI_GUID")
+        self.bv.import_library_type("EFI_STATUS")
+        self.bv.import_library_type("EFI_HANDLE")
+        self.bv.import_library_type("EFI_SYSTEM_TABLE")
+        self.bv.import_library_type("EFI_BOOT_SERVICES")
+        self.bv.import_library_type("EFI_RUNTIME_SERVICES")
+        self.bv.import_library_type("EFI_PEI_FILE_HANDLE")
+        self.bv.import_library_type("EFI_PEI_SERVICES")
 
     def _set_entry_point_prototype(self):
         """Apply correct prototype to the module entry point
@@ -59,7 +66,10 @@ class UEFIHelper(BackgroundTaskThread):
 
         _start = self.bv.get_function_at(self.bv.entry_point)
         if self.bv.view_type != 'TE':
-            _start.type = "EFI_STATUS ModuleEntryPoint(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)"
+            _start.parameter_vars[0].type = "EFI_HANDLE"
+            _start.parameter_vars[0].name = "ImageHandle"
+            _start.parameter_vars[1].type = "EFI_SYSTEM_TABLE *"
+            _start.parameter_vars[1].name = "SystemTable"
 
     def _load_guids(self):
         """Read known GUIDs from CSV and convert string GUIDs to bytes
@@ -134,34 +144,40 @@ class UEFIHelper(BackgroundTaskThread):
 
         :param instr: High level IL instruction object
         """
-
+        print("%x: checking %s" % (instr.address, instr))
         if instr.operation != HighLevelILOperation.HLIL_ASSIGN:
+            print("%x: NOT ASSIGN %s" % (instr.address, instr))
             return
 
         if instr.dest.operation != HighLevelILOperation.HLIL_DEREF:
+            print("%x: DEST NOT DEREF %s" % (instr.address, instr.dest))
             return
 
         if instr.dest.src.operation != HighLevelILOperation.HLIL_CONST_PTR:
+            print("%x: DEST.SRC NOT CONST_PTR %s" % (instr.address, instr.dest.src))
             return
 
         if instr.src.operation != HighLevelILOperation.HLIL_VAR:
+            print("%x: SRC NOT VAR %s" % (instr.address, instr.src))
             return
 
         _type = instr.src.var.type
+        print("%x: VAR TYPE %s" % (instr.address, instr.src.var.type))
         if len(_type.tokens) == 1 and str(_type.tokens[0]) == 'EFI_HANDLE':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gHandle'))
-        elif len(_type.tokens) > 2 and str(_type.tokens[2]) == 'EFI_BOOT_SERVICES':
+        elif len(_type.tokens) == 2 and str(_type.tokens[0]) == 'EFI_BOOT_SERVICES':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gBS'))
             self.gbs_assignments.append(instr.dest.src.constant)
-        elif len(_type.tokens) > 2 and str(_type.tokens[2]) == 'EFI_RUNTIME_SERVICES':
+        elif len(_type.tokens) == 2 and str(_type.tokens[0]) == 'EFI_RUNTIME_SERVICES':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gRS'))
-        elif len(_type.tokens) > 2 and str(_type.tokens[2]) == 'EFI_SYSTEM_TABLE':
+        elif len(_type.tokens) == 2 and str(_type.tokens[0]) == 'EFI_SYSTEM_TABLE':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gST'))
         elif len(_type.tokens) == 1 and str(_type.tokens[0]) == 'EFI_PEI_FILE_HANDLE':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gHandle'))
-        elif len(_type.tokens) > 2 and str(_type.tokens[2]) == 'EFI_PEI_SERVICES':
+        elif len(_type.tokens) == 2 and str(_type.tokens[0]) == 'EFI_PEI_SERVICES':
             self.bv.define_user_symbol(Symbol(SymbolType.DataSymbol, instr.dest.src.constant, 'gPeiServices'))
         else:
+            print("%x: NONE MATCHED %s, %s" % (instr.address, _type.tokens, instr.dest.src.constant))
             return
 
         self.bv.define_user_data_var(instr.dest.src.constant, instr.src.var.type)
@@ -175,6 +191,9 @@ class UEFIHelper(BackgroundTaskThread):
         :param instr: High level IL instruction object
         """
 
+        if instr.operation in [HighLevelILOperation.HLIL_ASSIGN, HighLevelILOperation.HLIL_ASSIGN_UNPACK]:
+            instr = instr.src;
+        
         if instr.operation not in [HighLevelILOperation.HLIL_TAILCALL, HighLevelILOperation.HLIL_CALL]:
             return
 
@@ -191,30 +210,16 @@ class UEFIHelper(BackgroundTaskThread):
             return
 
         func = self.bv.get_function_at(instr.dest.constant)
-        old = func.type
-        call_args = instr.params
-        new_params = []
-        for arg, param in zip(call_args, old.parameters):
+        num_params = len(func.parameter_vars)
+        for i in range(num_params):
+            arg = instr.params[i]
             if hasattr(arg, 'var'):
-                new_type = arg.var.type
-            else:
-                new_type = param.type
-            new_type.confidence = 256
-            new_params.append(FunctionParameter(new_type, param.name))
-
-        # TODO: this is a hack to account for odd behavior. func.type should be able to set directly to
-        # Type.Function(...). However, during testing this isn't the case. I am only able to get it to work if I
-        # set type to a string and update analysis.
-        gross_hack = str(
-            Type.function(old.return_value, new_params, old.calling_convention,
-                          old.has_variable_arguments, old.stack_adjustment)
-        ).replace('(', '{}('.format(func.name))
-        try:
-            func.type = gross_hack
-            self.bv.update_analysis_and_wait()
-        except SyntaxError:
-            pass # BN can't parse int48_t and other types despite that it uses it. Ran into this from a sidt instruction
-
+                typename = arg.var.type
+                if "EFI_" in str(typename):
+                    func.parameter_vars[i].name = arg.var.name
+                    func.parameter_vars[i].type = arg.var.type
+    
+    
     def _set_global_variables(self):
         """On entry, UEFI modules usually set global variables for EFI_BOOT_SERVICES, EFI_RUNTIME_SERIVCES, and
         EFI_SYSTEM_TABLE. This function attempts to identify these assignments and apply types.
